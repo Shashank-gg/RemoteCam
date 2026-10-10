@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Matrix
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
 import android.os.Build
 import android.os.Bundle
@@ -25,6 +26,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.*
@@ -41,6 +43,7 @@ import java.io.*
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.ServerSocket
+import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
@@ -97,7 +100,7 @@ class HostActivity : ComponentActivity() {
     private fun start() {
         audioOk = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val f = ProcessCameraProvider.getInstance(this)
-        f.addListener({ provider = f.get(); bind(true); startServer() }, ContextCompat.getMainExecutor(this))
+        f.addListener({ provider = f.get(); bind(0); startServer() }, ContextCompat.getMainExecutor(this))
     }
 
     private fun sel169(max: Size?): ResolutionSelector = ResolutionSelector.Builder()
@@ -108,15 +111,19 @@ class HostActivity : ComponentActivity() {
         ).build()
 
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
-    private fun bind(useFps: Boolean) {
+    private fun bind(level: Int) {
         val p = provider ?: return
         p.unbindAll()
-        val fps = Range(30, 30)
+        val selector = CameraSelector.Builder().requireLensFacing(lens).build()
+        // level 0 = best fps the phone supports (up to 60), 1 = fixed 30, 2 = camera default
+        val fps: Range<Int>? = when (level) { 0 -> pickFps(p, selector); 1 -> Range(30, 30); else -> null }
+        fpsLabel = fps?.let { "${it.lower}-${it.upper}" } ?: "auto"
 
         val pb = Preview.Builder().setResolutionSelector(sel169(Size(1920, 1080)))
-        val ab = ImageAnalysis.Builder().setResolutionSelector(sel169(Size(1280, 720)))
+        val ab = ImageAnalysis.Builder().setResolutionSelector(sel169(Size(960, 540)))
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-        if (useFps) {
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+        if (fps != null) {
             Camera2Interop.Extender(pb).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps)
             Camera2Interop.Extender(ab).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps)
         }
@@ -138,40 +145,75 @@ class HostActivity : ComponentActivity() {
             cases.add(videoCap!!)
         }
         try {
-            camera = p.bindToLifecycle(this, CameraSelector.Builder().requireLensFacing(lens).build(), *cases.toTypedArray())
+            camera = p.bindToLifecycle(this, selector, *cases.toTypedArray())
         } catch (e: Exception) {
-            if (useFps) { bind(false); return }
+            if (level < 2) { bind(level + 1); return }
             sendText("MSG Camera error: ${e.message}")
             return
         }
         info()
     }
 
+    private var fpsLabel = "auto"
+
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun pickFps(p: ProcessCameraProvider, sel: CameraSelector): Range<Int>? = try {
+        val ci = sel.filter(p.availableCameraInfos).firstOrNull()
+        val all = ci?.let { Camera2CameraInfo.from(it).getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) }
+        val ranges = all?.filter { it.upper <= 60 } ?: emptyList()
+        if (ranges.isEmpty()) null else {
+            val maxUp = ranges.maxOf { it.upper }
+            val top = ranges.filter { it.upper == maxUp }
+            // for 60: prefer an adaptive 30-60 range (stays bright in dim light); otherwise the tightest range
+            if (maxUp >= 60) top.minByOrNull { Math.abs(it.lower - 30) } else top.maxByOrNull { it.lower }
+        }
+    } catch (_: Exception) { null }
+
     private fun info() {
         val c = camera ?: return
+        sendText("MSG Camera fps range: $fpsLabel")
         val r = c.cameraInfo.exposureState.exposureCompensationRange
         val z = c.cameraInfo.zoomState.value
         sendText("INFO ${r.lower} ${r.upper} ${z?.minZoomRatio ?: 1f} ${z?.maxZoomRatio ?: 1f}")
         sendText("STATE $mode ${if (recording != null) 1 else 0}")
     }
 
+    private var quality = 65
+    private var reuse: Bitmap? = null
+    private val frameBuf = ByteArrayOutputStream(120_000)
+
     private fun stream(img: ImageProxy) {
         val now = SystemClock.elapsedRealtime()
-        if (out == null || now - lastSent < 30) { img.close(); return }
+        if (out == null || now - lastSent < 12) { img.close(); return }
         lastSent = now
         try {
-            val bmp = img.toBitmap()
-            val m = Matrix().apply { postRotate(img.imageInfo.rotationDegrees.toFloat()) }
-            val r = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
-            val bos = ByteArrayOutputStream()
-            r.compress(Bitmap.CompressFormat.JPEG, 70, bos)
-            send(0, bos.toByteArray())
+            val plane = img.planes[0]
+            val bmp: Bitmap
+            if (plane.rowStride == img.width * 4) {
+                var r = reuse
+                if (r == null || r.width != img.width || r.height != img.height) {
+                    r = Bitmap.createBitmap(img.width, img.height, Bitmap.Config.ARGB_8888); reuse = r
+                }
+                plane.buffer.rewind(); r.copyPixelsFromBuffer(plane.buffer); bmp = r
+            } else bmp = img.toBitmap()
+            frameBuf.reset()
+            frameBuf.write((img.imageInfo.rotationDegrees / 90) and 3)   // remote rotates the picture
+            bmp.compress(Bitmap.CompressFormat.JPEG, quality, frameBuf)
+            val t0 = SystemClock.elapsedRealtime()
+            send(2, frameBuf.toByteArray())
+            val dt = SystemClock.elapsedRealtime() - t0
+            // adaptive quality: slow network -> smaller frames -> no growing delay
+            quality = if (dt > 20) maxOf(35, quality - 5) else if (dt < 6) minOf(75, quality + 1) else quality
         } catch (_: Exception) {
         } finally { img.close() }
     }
 
     @Synchronized private fun send(type: Int, d: ByteArray) {
-        try { out?.run { writeByte(type); writeInt(d.size); write(d); flush() } } catch (_: IOException) { out = null }
+        try {
+            val o = out ?: return
+            val pkt = ByteBuffer.allocate(5 + d.size).put(type.toByte()).putInt(d.size).put(d).array()
+            o.write(pkt); o.flush()
+        } catch (_: IOException) { out = null }
     }
     private fun sendText(s: String) = netExec.execute { send(1, s.toByteArray()) }
 
@@ -183,7 +225,8 @@ class HostActivity : ComponentActivity() {
                 while (true) {
                     val s = server!!.accept()
                     s.tcpNoDelay = true
-                    out = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 1 shl 16))
+                    s.sendBufferSize = 64 * 1024   // small buffer = no seconds of queued video
+                    out = DataOutputStream(s.getOutputStream())
                     runOnUiThread { status.text = "Remote connected ✔"; qrBox.visibility = View.GONE; info() }
                     try {
                         BufferedReader(InputStreamReader(s.getInputStream())).forEachLine { l -> runOnUiThread { handle(l) } }
@@ -213,9 +256,9 @@ class HostActivity : ComponentActivity() {
                 "TORCH" -> c.cameraControl.enableTorch(p[1] == "1")
                 "SWITCH" -> if (recording == null) {
                     lens = if (lens == CameraSelector.LENS_FACING_BACK) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
-                    bind(true)
+                    bind(0)
                 }
-                "MODE" -> if (recording == null && p[1] != mode) { mode = p[1]; bind(true) }
+                "MODE" -> if (recording == null && p[1] != mode) { mode = p[1]; bind(0) }
                 "FOCUS" -> {
                     val pt = pv.meteringPointFactory.createPoint(p[1].toFloat() * pv.width, p[2].toFloat() * pv.height)
                     c.cameraControl.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
