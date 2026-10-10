@@ -1,5 +1,6 @@
 package com.remotecam
 
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
@@ -22,6 +23,10 @@ import java.io.PrintWriter
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /** The REMOTE phone: live view of the camera phone + controls. */
@@ -42,6 +47,11 @@ class RemoteActivity : ComponentActivity() {
     private var bmpW = 1
     private var bmpH = 1
     private var torch = false
+    private lateinit var fpsView: TextView
+    private val frameRef = AtomicReference<ByteArray?>()   // newest undecoded frame (older ones are dropped)
+    private val frameSignal = Semaphore(0)
+    private val pending = AtomicReference<Bitmap?>()
+    private val frames = AtomicInteger()
     private var curMode = "PHOTO"
     private var recording = false
     private var recStart = 0L
@@ -119,6 +129,26 @@ class RemoteActivity : ComponentActivity() {
             textSize = 20f; setTextColor(Color.RED); setBackgroundColor(0x88000000.toInt()); setPadding(dp(12), dp(6), dp(12), dp(6)); visibility = View.GONE
         }
         root.addView(recTime, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(40) })
+        fpsView = TextView(this).apply { textSize = 12f; setTextColor(Color.GREEN); setBackgroundColor(0x88000000.toInt()); setPadding(dp(8), dp(2), dp(8), dp(2)) }
+        root.addView(fpsView, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply { topMargin = dp(40); leftMargin = dp(8) })
+        handler.post(object : Runnable {
+            override fun run() { val n = frames.getAndSet(0); fpsView.text = if (n > 0) "$n fps" else ""; handler.postDelayed(this, 1000) }
+        })
+        // decoder thread: always decodes only the NEWEST frame, so the picture never lags behind
+        thread(isDaemon = true) {
+            while (!isDestroyed) {
+                if (!frameSignal.tryAcquire(500, TimeUnit.MILLISECONDS)) continue
+                val b = frameRef.getAndSet(null) ?: continue
+                try {
+                    var bmp = BitmapFactory.decodeByteArray(b, 1, b.size - 1) ?: continue
+                    val rot = (b[0].toInt() and 3) * 90
+                    if (rot != 0) bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(rot.toFloat()) }, true)
+                    bmpW = bmp.width; bmpH = bmp.height
+                    frames.incrementAndGet()
+                    if (pending.getAndSet(bmp) == null) ui { pending.getAndSet(null)?.let { iv.setImageBitmap(it) } }
+                } catch (_: Exception) {}
+            }
+        }
 
         val zoom = SeekBar(this).apply { max = 1000 }
         zoom.setOnSeekBarChangeListener(object : SimpleSeek() {
@@ -198,14 +228,14 @@ class RemoteActivity : ComponentActivity() {
         Toast.makeText(this, "Connecting…", Toast.LENGTH_SHORT).show()
         thread {
             try {
-                val s = Socket(); s.connect(InetSocketAddress(host, port), 4000); s.tcpNoDelay = true
+                val s = Socket(); s.receiveBufferSize = 128 * 1024; s.connect(InetSocketAddress(host, port), 4000); s.tcpNoDelay = true
                 sock = s; w = PrintWriter(s.getOutputStream(), true)
                 ui { connectPanel.visibility = View.GONE; controls.visibility = View.VISIBLE }
-                val d = DataInputStream(BufferedInputStream(s.getInputStream(), 1 shl 16))
+                val d = DataInputStream(BufferedInputStream(s.getInputStream(), 1 shl 17))
                 while (true) {
                     val t = d.readUnsignedByte(); val n = d.readInt()
                     val buf = ByteArray(n); d.readFully(buf)
-                    if (t == 0) BitmapFactory.decodeByteArray(buf, 0, n)?.let { b -> bmpW = b.width; bmpH = b.height; ui { iv.setImageBitmap(b) } }
+                    if (t == 2) { if (frameRef.getAndSet(buf) == null) frameSignal.release() }
                     else onText(String(buf))
                 }
             } catch (e: Exception) {
